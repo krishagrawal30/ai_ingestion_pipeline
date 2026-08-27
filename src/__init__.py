@@ -1,0 +1,1 @@
+"""AI intelligence ingestion pipeline."""
