@@ -6,6 +6,8 @@ import os
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+import httpx
+
 try:
     from dotenv import load_dotenv
 except ImportError:  # pragma: no cover - optional dependency in minimal environments
@@ -48,14 +50,15 @@ def grounded_json_provider(required_source_url: str) -> Provider:
     return provider
 
 
-def groq_provider(model: str = "llama-3.3-70b-versatile") -> Provider:
+def groq_provider(model: str = "openai/gpt-oss-120b") -> Provider:
+    """Groq deprecated llama-3.1-8b-instant and llama-3.3-70b-versatile in
+    June 2026 — openai/gpt-oss-120b is the current equivalent as of Aug
+    2026. If this 404s later, check console.groq.com/docs/models."""
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
         raise RuntimeError("GROQ_API_KEY is missing. Add it to the project root environment file before calling Groq.")
 
     async def provider(prompt: str) -> dict[str, Any]:
-        import httpx
-
         async with httpx.AsyncClient(timeout=60) as client:
             response = await client.post(
                 "https://api.groq.com/openai/v1/chat/completions",

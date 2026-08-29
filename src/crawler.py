@@ -117,9 +117,14 @@ def parse_feed(xml: str, source: FeedSource, now=None) -> list[Record]:
         date = parse_date(_text(item, "pubDate", "published", "updated", "{http://www.w3.org/2005/Atom}updated"), now)
         if not title or not link or not is_fresh(date, now):
             continue
+        description = _text(item, "description", "summary", "{http://www.w3.org/2005/Atom}summary")
         content: dict[str, Any] = {"title": title, "url": link, "date": date.isoformat() if date else None}
         if source.record_type == "JOB":
+            # Honest placeholders in case LLM enrichment is skipped/fails.
+            # `_raw_description` is consumed and stripped by
+            # pipeline.enrich_job() — it never reaches the final schema.
             content.update({"company": "Unknown", "is_remote": "remote" in title.lower(), "role_family": "Engineering"})
+            content["_raw_description"] = f"{title}\n{description}".strip()
         records.append(Record("1.0", source.record_type, Source(source.name, link), content, now_utc().isoformat()))
     return records
 
