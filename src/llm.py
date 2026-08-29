@@ -24,6 +24,13 @@ Provider = Callable[[str], Awaitable[dict[str, Any]]]
 
 
 class LLMOrchestrator:
+    """Multi-provider LLM orchestrator with automatic fallback.
+
+    Providers are tried in order; if one fails the next is attempted.
+    Payloads exceeding *max_chars* are split into semantic chunks and
+    each chunk is sent independently, with results merged.
+    """
+
     def __init__(self, providers: list[tuple[str, Provider]], max_chars: int = 12000) -> None:
         self.providers = providers
         self.max_chars = max_chars
@@ -50,13 +57,63 @@ def grounded_json_provider(required_source_url: str) -> Provider:
     return provider
 
 
+def _parse_llm_json(content: str) -> dict[str, Any]:
+    """Best-effort JSON extraction from LLM output."""
+    text = content.strip()
+    # Strip markdown fences if present
+    if text.startswith("```"):
+        lines = text.splitlines()
+        lines = [l for l in lines if not l.strip().startswith("```")]
+        text = "\n".join(lines).strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return {"content": content, "source_url": "unknown"}
+
+
+# ---------------------------------------------------------------------------
+# Provider: Google Gemini Flash
+# ---------------------------------------------------------------------------
+
+def gemini_provider(model: str = "gemini-2.0-flash") -> Provider:
+    """Google Gemini via the REST generateContent endpoint."""
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is missing.")
+
+    async def provider(prompt: str) -> dict[str, Any]:
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}"
+            f":generateContent?key={api_key}"
+        )
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await client.post(
+                url,
+                headers={"Content-Type": "application/json"},
+                json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {"temperature": 0.1},
+                },
+            )
+            response.raise_for_status()
+            data = response.json()
+            content = data["candidates"][0]["content"]["parts"][0]["text"]
+            return _parse_llm_json(content)
+
+    return provider
+
+
+# ---------------------------------------------------------------------------
+# Provider: Groq
+# ---------------------------------------------------------------------------
+
 def groq_provider(model: str = "openai/gpt-oss-120b") -> Provider:
     """Groq deprecated llama-3.1-8b-instant and llama-3.3-70b-versatile in
     June 2026 — openai/gpt-oss-120b is the current equivalent as of Aug
     2026. If this 404s later, check console.groq.com/docs/models."""
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
-        raise RuntimeError("GROQ_API_KEY is missing. Add it to the project root environment file before calling Groq.")
+        raise RuntimeError("GROQ_API_KEY is missing.")
 
     async def provider(prompt: str) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=60) as client:
@@ -75,9 +132,57 @@ def groq_provider(model: str = "openai/gpt-oss-120b") -> Provider:
             response.raise_for_status()
             data = response.json()
             content = data["choices"][0]["message"]["content"]
-            try:
-                return json.loads(content)
-            except json.JSONDecodeError:
-                return {"content": content, "source_url": "unknown"}
+            return _parse_llm_json(content)
 
     return provider
+
+
+# ---------------------------------------------------------------------------
+# Provider: DeepSeek
+# ---------------------------------------------------------------------------
+
+def deepseek_provider(model: str = "deepseek-chat") -> Provider:
+    """DeepSeek via their OpenAI-compatible chat completions endpoint."""
+    api_key = os.getenv("DEEPSEEK_API_KEY")
+    if not api_key:
+        raise RuntimeError("DEEPSEEK_API_KEY is missing.")
+
+    async def provider(prompt: str) -> dict[str, Any]:
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await client.post(
+                "https://api.deepseek.com/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.1,
+                },
+            )
+            response.raise_for_status()
+            data = response.json()
+            content = data["choices"][0]["message"]["content"]
+            return _parse_llm_json(content)
+
+    return provider
+
+
+# ---------------------------------------------------------------------------
+# Convenience: build the full fallback chain
+# ---------------------------------------------------------------------------
+
+def build_provider_chain() -> list[tuple[str, Provider]]:
+    """Return all available providers in priority order: Gemini → Groq → DeepSeek.
+
+    Providers whose API keys are missing are silently skipped so the
+    pipeline can run with whatever credentials are available.
+    """
+    chain: list[tuple[str, Provider]] = []
+    for name, factory in [("gemini", gemini_provider), ("groq", groq_provider), ("deepseek", deepseek_provider)]:
+        try:
+            chain.append((name, factory()))
+        except RuntimeError:
+            logger.info("provider_skipped provider=%s reason=missing_api_key", name)
+    return chain

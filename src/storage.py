@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Iterable
 
 from .models import Record
+from .resolver import MappingEvent
 
 
 def write_jsonl(records: Iterable[Record], path: Path) -> None:
@@ -16,15 +17,44 @@ def write_jsonl(records: Iterable[Record], path: Path) -> None:
 
 
 def export_tabs(records: Iterable[Record], output_dir: Path) -> None:
+    """Export records into per-type CSV files matching the 6 Google Sheet tabs."""
     output_dir.mkdir(parents=True, exist_ok=True)
     groups: dict[str, list[Record]] = {}
     for record in records:
         groups.setdefault(record.recordType, []).append(record)
-    names = {"STARTUP": "Startups", "PRODUCT": "Products", "RESEARCH_PAPER": "Research Papers", "JOB": "Jobs", "NEWS": "News"}
+    names = {
+        "STARTUP": "Startups",
+        "PRODUCT": "Products",
+        "RESEARCH_PAPER": "Research Papers",
+        "JOB": "Jobs",
+        "NEWS": "News",
+    }
     for record_type, filename in names.items():
         rows = groups.get(record_type, [])
         with (output_dir / f"{filename}.csv").open("w", newline="", encoding="utf-8") as output:
             writer = csv.DictWriter(output, fieldnames=["schemaVersion", "recordType", "source_name", "source_url", "content", "collectedAt"])
             writer.writeheader()
             for record in rows:
-                writer.writerow({"schemaVersion": record.schemaVersion, "recordType": record.recordType, "source_name": record.source.name, "source_url": record.source.url, "content": json.dumps(record.content, ensure_ascii=True), "collectedAt": record.collectedAt})
+                writer.writerow({
+                    "schemaVersion": record.schemaVersion,
+                    "recordType": record.recordType,
+                    "source_name": record.source.name,
+                    "source_url": record.source.url,
+                    "content": json.dumps(record.content, ensure_ascii=True),
+                    "collectedAt": record.collectedAt,
+                })
+
+
+def write_entity_log(events: Iterable[MappingEvent], output_dir: Path) -> None:
+    """Write the Entity Mapping Log CSV — the 6th required Google Sheet tab."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / "Entity Mapping Log.csv"
+    with path.open("w", newline="", encoding="utf-8") as output:
+        writer = csv.DictWriter(output, fieldnames=["raw_name", "canonical_name", "method"])
+        writer.writeheader()
+        for event in events:
+            writer.writerow({
+                "raw_name": event.raw_name,
+                "canonical_name": event.canonical_name,
+                "method": event.method,
+            })

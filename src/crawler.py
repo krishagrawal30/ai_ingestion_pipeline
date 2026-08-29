@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import urllib.request
+import os
 import urllib.parse
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from typing import Any
+
+import aiohttp
 
 from .freshness import is_fresh, parse_date
 from .models import Record, Source, now_utc
@@ -39,6 +41,9 @@ JOB_SOURCES = [
     FeedSource("Remotive AI", "https://remotive.com/remote-jobs/feed/ai", "JOB"),
 ]
 
+_DEFAULT_HEADERS = {"User-Agent": "ai-ingestion-pipeline/1.0"}
+_TIMEOUT = aiohttp.ClientTimeout(total=30)
+
 
 class TextParser(HTMLParser):
     def __init__(self) -> None:
@@ -64,6 +69,43 @@ def extract_text(html: str) -> str:
     return "\n".join(parser.parts)
 
 
+# ---------------------------------------------------------------------------
+# Async HTTP helpers (aiohttp-based)
+# ---------------------------------------------------------------------------
+
+async def fetch(url: str, headers: dict[str, str] | None = None, timeout: int = 30) -> str:
+    """Fetch a URL asynchronously using aiohttp with retry/backoff."""
+    merged = {**_DEFAULT_HEADERS, **(headers or {})}
+    ct = aiohttp.ClientTimeout(total=timeout)
+
+    async def _do_fetch() -> str:
+        async with aiohttp.ClientSession(headers=merged, timeout=ct) as session:
+            async with session.get(url) as response:
+                response.raise_for_status()
+                return await response.text(encoding="utf-8", errors="replace")
+
+    return await with_backoff(_do_fetch)
+
+
+async def fetch_json(url: str, headers: dict[str, str] | None = None, timeout: int = 30) -> Any:
+    """Fetch JSON from a URL asynchronously."""
+    merged = {**_DEFAULT_HEADERS, **(headers or {})}
+    merged.setdefault("Accept", "application/json")
+    ct = aiohttp.ClientTimeout(total=timeout)
+
+    async def _do_fetch() -> Any:
+        async with aiohttp.ClientSession(headers=merged, timeout=ct) as session:
+            async with session.get(url) as response:
+                response.raise_for_status()
+                return await response.json(content_type=None)
+
+    return await with_backoff(_do_fetch)
+
+
+# ---------------------------------------------------------------------------
+# GitHub helpers
+# ---------------------------------------------------------------------------
+
 async def github_stars(repository_url: str, token: str | None = None) -> int | None:
     """Read current stars from GitHub; return None when the URL is not verifiable."""
     parsed = urllib.parse.urlparse(repository_url)
@@ -71,31 +113,20 @@ async def github_stars(repository_url: str, token: str | None = None) -> int | N
     if parsed.netloc.lower() != "github.com" or len(parts) < 2:
         return None
     api_url = f"https://api.github.com/repos/{parts[0]}/{parts[1]}"
-
-    def request() -> int | None:
-        headers = {"User-Agent": "ai-ingestion-pipeline/1.0", "Accept": "application/vnd.github+json"}
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-        req = urllib.request.Request(api_url, headers=headers)
-        try:
-            with urllib.request.urlopen(req, timeout=20) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-                stars = payload.get("stargazers_count")
-                return stars if isinstance(stars, int) else None
-        except Exception:
-            return None
-
-    return await asyncio.to_thread(request)
+    headers: dict[str, str] = {"Accept": "application/vnd.github+json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        data = await fetch_json(api_url, headers=headers, timeout=20)
+        stars = data.get("stargazers_count")
+        return stars if isinstance(stars, int) else None
+    except Exception:
+        return None
 
 
-async def fetch(url: str, timeout: int = 20) -> str:
-    def request() -> str:
-        req = urllib.request.Request(url, headers={"User-Agent": "ai-ingestion-pipeline/1.0"})
-        with urllib.request.urlopen(req, timeout=timeout) as response:
-            return response.read().decode("utf-8", errors="replace")
-
-    return await with_backoff(lambda: asyncio.to_thread(request))
-
+# ---------------------------------------------------------------------------
+# RSS/Atom feed parsing
+# ---------------------------------------------------------------------------
 
 def _text(element: ET.Element, *names: str) -> str:
     for name in names:
@@ -144,16 +175,299 @@ async def crawl_feeds(sources: list[FeedSource], concurrency: int = 10) -> list[
     return [record for batch in results for record in batch]
 
 
-async def crawl_arxiv(query: str = "cat:cs.AI", max_results: int = 100) -> list[Record]:
-    url = "https://export.arxiv.org/api/query?search_query=" + urllib.parse.quote(query) + f"&max_results={max_results}"
-    root = ET.fromstring(await fetch(url))
+# ---------------------------------------------------------------------------
+# ArXiv crawler (paginated to support 1000+ papers)
+# ---------------------------------------------------------------------------
+
+async def crawl_arxiv(query: str = "cat:cs.AI", max_results: int = 1000) -> list[Record]:
+    """Fetch papers from ArXiv using pagination (start + max_results).
+
+    ArXiv API limits each request to ~2000 results, so we paginate in
+    batches of 200 to stay well within limits and be polite.
+    """
     records: list[Record] = []
+    batch_size = 200
+    start = 0
     namespace = "{http://www.w3.org/2005/Atom}"
-    for entry in root.findall(f"{namespace}entry"):
-        title = _text(entry, f"{namespace}title")
-        paper_url = _text(entry, f"{namespace}id")
-        published = parse_date(_text(entry, f"{namespace}published"))
-        authors = [author.text.strip() for author in entry.findall(f"{namespace}author/{namespace}name") if author.text]
-        if title and paper_url:
-            records.append(Record("1.0", "RESEARCH_PAPER", Source("ArXiv", paper_url), {"title": title, "authors": authors, "paper_url": paper_url, "github_url": None, "github_stars": None, "published_date": published.isoformat() if published else None}, now_utc().isoformat()))
+
+    while len(records) < max_results:
+        remaining = max_results - len(records)
+        fetch_count = min(batch_size, remaining)
+        url = (
+            "https://export.arxiv.org/api/query?search_query="
+            + urllib.parse.quote(query)
+            + f"&start={start}&max_results={fetch_count}&sortBy=submittedDate&sortOrder=descending"
+        )
+        try:
+            xml_text = await fetch(url, timeout=60)
+            root = ET.fromstring(xml_text)
+        except Exception as error:
+            logger.warning("arxiv_page_failed start=%d error=%s", start, error)
+            break
+
+        entries = root.findall(f"{namespace}entry")
+        if not entries:
+            break
+
+        for entry in entries:
+            if len(records) >= max_results:
+                break
+            title = _text(entry, f"{namespace}title")
+            paper_url = _text(entry, f"{namespace}id")
+            published = parse_date(_text(entry, f"{namespace}published"))
+            authors = [
+                author.text.strip()
+                for author in entry.findall(f"{namespace}author/{namespace}name")
+                if author.text
+            ]
+            if title and paper_url:
+                records.append(Record(
+                    "1.0", "RESEARCH_PAPER",
+                    Source("ArXiv", paper_url),
+                    {
+                        "title": title,
+                        "authors": authors,
+                        "paper_url": paper_url,
+                        "github_url": None,
+                        "github_stars": None,
+                        "published_date": published.isoformat() if published else None,
+                    },
+                    now_utc().isoformat(),
+                ))
+
+        start += len(entries)
+        # ArXiv asks for 3s delay between requests
+        await asyncio.sleep(3.0)
+
+    logger.info("arxiv_crawled count=%d", len(records))
+    return records
+
+
+# ---------------------------------------------------------------------------
+# HuggingFace Daily Papers crawler (replaces defunct PapersWithCode API)
+# ---------------------------------------------------------------------------
+
+async def crawl_hf_papers(max_results: int = 1000) -> list[Record]:
+    """Fetch AI/ML papers from HuggingFace Daily Papers API with GitHub links."""
+    records: list[Record] = []
+    offset = 0
+    batch_size = 100
+
+    while len(records) < max_results:
+        remaining = max_results - len(records)
+        limit = min(batch_size, remaining)
+        url = f"https://huggingface.co/api/daily_papers?limit={limit}&offset={offset}"
+        try:
+            data = await fetch_json(url, timeout=30)
+        except Exception as error:
+            logger.warning("hf_papers_page_failed offset=%d error=%s", offset, error)
+            break
+
+        if not data or not isinstance(data, list):
+            break
+
+        for item in data:
+            if len(records) >= max_results:
+                break
+            paper = item.get("paper", {})
+            paper_id = paper.get("id", "")
+            title = item.get("title") or paper.get("title", "")
+            paper_url = f"https://arxiv.org/abs/{paper_id}" if paper_id else ""
+
+            authors_raw = paper.get("authors", [])
+            authors = []
+            for a in authors_raw:
+                if isinstance(a, str):
+                    authors.append(a)
+                elif isinstance(a, dict):
+                    authors.append(a.get("name", ""))
+
+            published = item.get("publishedAt")
+
+            content: dict[str, Any] = {
+                "title": title,
+                "authors": authors,
+                "paper_url": paper_url,
+                "github_url": None,
+                "github_stars": None,
+                "published_date": published,
+            }
+
+            if title and paper_url:
+                records.append(Record(
+                    "1.0", "RESEARCH_PAPER",
+                    Source("HuggingFace", paper_url),
+                    content,
+                    now_utc().isoformat(),
+                ))
+
+        if len(data) < limit:
+            break  # No more pages
+        offset += len(data)
+        await asyncio.sleep(0.5)
+
+    logger.info("hf_papers_crawled count=%d", len(records))
+    return records
+
+
+# ---------------------------------------------------------------------------
+# GitHub-based Startup crawler
+# ---------------------------------------------------------------------------
+
+# AI-related search queries to discover startup-like organizations on GitHub
+_STARTUP_QUERIES = [
+    "artificial intelligence",
+    "machine learning startup",
+    "deep learning",
+    "generative AI",
+    "LLM",
+    "computer vision",
+    "NLP",
+    "robotics AI",
+    "AI platform",
+    "MLOps",
+]
+
+
+async def crawl_startups(max_results: int = 1000) -> list[Record]:
+    """Discover AI startups via GitHub repository search (org-backed repos)."""
+    records: list[Record] = []
+    seen_orgs: set[str] = set()
+    gh_token = os.getenv("GITHUB_TOKEN")
+    headers: dict[str, str] = {"Accept": "application/vnd.github+json"}
+    if gh_token:
+        headers["Authorization"] = f"Bearer {gh_token}"
+
+    for query in _STARTUP_QUERIES:
+        if len(records) >= max_results:
+            break
+        page = 1
+        while len(records) < max_results and page <= 10:
+            search_url = (
+                f"https://api.github.com/search/repositories?"
+                f"q={urllib.parse.quote(query)}+language:python&sort=stars&order=desc"
+                f"&per_page=100&page={page}"
+            )
+            try:
+                data = await fetch_json(search_url, headers=headers, timeout=30)
+            except Exception as error:
+                logger.warning("github_startup_search_failed query=%s page=%d error=%s", query, page, error)
+                break
+
+            items = data.get("items", [])
+            if not items:
+                break
+
+            for repo in items:
+                if len(records) >= max_results:
+                    break
+                owner = repo.get("owner", {})
+                org_name = owner.get("login", "")
+                if not org_name or org_name in seen_orgs:
+                    continue
+                seen_orgs.add(org_name)
+
+                content: dict[str, Any] = {
+                    "name": org_name,
+                    "website": repo.get("homepage") or f"https://github.com/{org_name}",
+                    "description": (repo.get("description") or "")[:500],
+                    "github_url": f"https://github.com/{org_name}",
+                    "github_stars": repo.get("stargazers_count"),
+                    "language": repo.get("language"),
+                    "topics": repo.get("topics", []),
+                    "founded_date": repo.get("created_at"),
+                }
+                records.append(Record(
+                    "1.0", "STARTUP",
+                    Source("GitHub", f"https://github.com/{org_name}"),
+                    content,
+                    now_utc().isoformat(),
+                ))
+
+            page += 1
+            # Respect GitHub rate limits
+            await asyncio.sleep(2.0)
+
+    logger.info("startups_crawled count=%d", len(records))
+    return records
+
+
+# ---------------------------------------------------------------------------
+# GitHub-based Product crawler
+# ---------------------------------------------------------------------------
+
+_PRODUCT_QUERIES = [
+    "AI tool",
+    "machine learning framework",
+    "generative AI",
+    "LLM inference",
+    "AI assistant",
+    "text-to-image",
+    "speech recognition",
+    "AI chatbot",
+    "vector database",
+    "AI agent",
+]
+
+
+async def crawl_products(max_results: int = 1000) -> list[Record]:
+    """Discover AI products via GitHub repository search (popular repos as products)."""
+    records: list[Record] = []
+    seen_repos: set[str] = set()
+    gh_token = os.getenv("GITHUB_TOKEN")
+    headers: dict[str, str] = {"Accept": "application/vnd.github+json"}
+    if gh_token:
+        headers["Authorization"] = f"Bearer {gh_token}"
+
+    for query in _PRODUCT_QUERIES:
+        if len(records) >= max_results:
+            break
+        page = 1
+        while len(records) < max_results and page <= 10:
+            search_url = (
+                f"https://api.github.com/search/repositories?"
+                f"q={urllib.parse.quote(query)}&sort=stars&order=desc"
+                f"&per_page=100&page={page}"
+            )
+            try:
+                data = await fetch_json(search_url, headers=headers, timeout=30)
+            except Exception as error:
+                logger.warning("github_product_search_failed query=%s page=%d error=%s", query, page, error)
+                break
+
+            items = data.get("items", [])
+            if not items:
+                break
+
+            for repo in items:
+                if len(records) >= max_results:
+                    break
+                full_name = repo.get("full_name", "")
+                if not full_name or full_name in seen_repos:
+                    continue
+                seen_repos.add(full_name)
+
+                content: dict[str, Any] = {
+                    "name": repo.get("name", ""),
+                    "full_name": full_name,
+                    "description": (repo.get("description") or "")[:500],
+                    "url": repo.get("html_url", ""),
+                    "homepage": repo.get("homepage") or None,
+                    "github_stars": repo.get("stargazers_count"),
+                    "language": repo.get("language"),
+                    "topics": repo.get("topics", []),
+                    "license": (repo.get("license") or {}).get("spdx_id"),
+                    "last_updated": repo.get("updated_at"),
+                }
+                records.append(Record(
+                    "1.0", "PRODUCT",
+                    Source("GitHub", repo.get("html_url", "")),
+                    content,
+                    now_utc().isoformat(),
+                ))
+
+            page += 1
+            await asyncio.sleep(2.0)
+
+    logger.info("products_crawled count=%d", len(records))
     return records
