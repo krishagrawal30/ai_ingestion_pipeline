@@ -1,9 +1,0 @@
-[project]
-name = "ai-ingestion-pipeline"
-version = "1.0.0"
-description = "Small, provenance-first AI intelligence ingestion pipeline"
-requires-python = ">=3.11"
-
-[tool.pytest.ini_options]
-pythonpath = ["."]
-testpaths = ["tests"]
