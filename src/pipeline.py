@@ -29,8 +29,6 @@ def _build_orchestrator() -> LLMOrchestrator | None:
         logger.warning("no_groq_api_key job_fields_left_as_placeholders")
         return None
     return LLMOrchestrator([("groq", groq_provider())])
-
-
 async def enrich_job(record: Record, orchestrator: LLMOrchestrator | None) -> Record:
     """Replace the crawler's placeholder company/role_family/is_remote with
     real LLM-extracted values. Falls back to the honest placeholders —
@@ -50,11 +48,29 @@ async def enrich_job(record: Record, orchestrator: LLMOrchestrator | None) -> Re
     return record
 
 
+# Groq's free-tier rate limit is nowhere near "every job at once" — firing
+# all of them via a single asyncio.gather() causes a thundering-herd storm
+# where every task retries in lockstep and re-collides on the next attempt
+# (visible in real logs as synchronized bursts ~20s apart). Bounding
+# concurrency the same way crawl_feeds() already does fixes this.
+LLM_CONCURRENCY = 3
+
+
+async def enrich_jobs(jobs: list[Record], orchestrator: LLMOrchestrator | None) -> list[Record]:
+    semaphore = asyncio.Semaphore(LLM_CONCURRENCY)
+
+    async def bounded(job: Record) -> Record:
+        async with semaphore:
+            return await enrich_job(job, orchestrator)
+
+    return list(await asyncio.gather(*(bounded(job) for job in jobs)))
+
+
 async def run(output_dir: Path, paper_limit: int = 100) -> list[Record]:
     news, jobs, papers = await asyncio.gather(crawl_feeds(NEWS_SOURCES), crawl_feeds(JOB_SOURCES), crawl_arxiv(max_results=paper_limit))
 
     orchestrator = _build_orchestrator()
-    jobs = list(await asyncio.gather(*(enrich_job(job, orchestrator) for job in jobs)))
+    jobs = await enrich_jobs(jobs, orchestrator)
 
     records = [*news, *jobs, *papers]
     write_jsonl(records, output_dir / "records.jsonl")
