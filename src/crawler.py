@@ -29,17 +29,24 @@ class FeedSource:
 
 NEWS_SOURCES = [
     FeedSource("TechCrunch AI", "https://techcrunch.com/category/artificial-intelligence/feed/", "NEWS"),
-    FeedSource("MIT News AI", "https://news.mit.edu/topic/mitartificial-intelligence2/feed", "NEWS"),
+    FeedSource("MIT News AI", "https://news.mit.edu/rss/topic/artificial-intelligence2", "NEWS"),
     FeedSource("VentureBeat AI", "https://venturebeat.com/category/ai/feed/", "NEWS"),
     FeedSource("Google AI Blog", "https://blog.google/technology/ai/rss/", "NEWS"),
     FeedSource("The Decoder", "https://the-decoder.com/feed/", "NEWS"),
 ]
 JOB_SOURCES = [
     FeedSource("Himalayas AI", "https://himalayas.app/jobs/rss?query=artificial%20intelligence", "JOB"),
-    FeedSource("RemoteOK AI", "https://remoteok.com/remote-ai-jobs.rss", "JOB"),
+    # RemoteOK's old /remote-ai-jobs.rss endpoint is confirmed 410 Gone.
+    # Their current documented pattern is the base feed + ?tag= filter.
+    # NOTE: fetching this with a generic tool User-Agent returned RemoteOK's
+    # bot-warning page instead of RSS ("make sure your UA doesn't contain
+    # 'bot' or 'google'") - this crawler's own UA doesn't contain either,
+    # but worth checking source_failed logs for this one specifically on
+    # the next real run to confirm it actually returns RSS end-to-end.
+    FeedSource("RemoteOK AI", "https://remoteok.com/remote-jobs.rss?tag=ai", "JOB"),
     FeedSource("We Work Remotely", "https://weworkremotely.com/categories/remote-programming-jobs.rss", "JOB"),
     FeedSource("Working Nomads", "https://www.workingnomads.com/jobs/rss", "JOB"),
-    FeedSource("Remotive AI", "https://remotive.com/remote-jobs/feed/ai", "JOB"),
+    FeedSource("Remotive AI", "https://remotive.com/remote-jobs/feed/artificial-intelligence", "JOB"),
 ]
 
 _DEFAULT_HEADERS = {"User-Agent": "ai-ingestion-pipeline/1.0"}
@@ -137,8 +144,24 @@ def _text(element: ET.Element, *names: str) -> str:
     return ""
 
 
+_INVALID_XML_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+_BARE_AMPERSAND = re.compile(r"&(?!amp;|lt;|gt;|apos;|quot;|#\d+;|#x[0-9a-fA-F]+;)")
+
+
+def _sanitize_xml(xml: str) -> str:
+    """Real-world RSS feeds are frequently not strictly well-formed — most
+    often a bare '&' that should have been '&amp;', or stray control
+    characters. Rather than let one malformed feed kill that entire source
+    (crawl_feeds already isolates per-source failures, but this avoids
+    throwing one away that's actually recoverable), fix the common cases
+    before handing off to the strict stdlib parser."""
+    xml = _INVALID_XML_CONTROL_CHARS.sub("", xml)
+    xml = _BARE_AMPERSAND.sub("&amp;", xml)
+    return xml
+
+
 def parse_feed(xml: str, source: FeedSource, now=None) -> list[Record]:
-    root = ET.fromstring(xml)
+    root = ET.fromstring(_sanitize_xml(xml))
     records: list[Record] = []
     for item in root.findall(".//item") + root.findall(".//{http://www.w3.org/2005/Atom}entry"):
         title = _text(item, "title", "{http://www.w3.org/2005/Atom}title")
@@ -340,11 +363,20 @@ async def crawl_hf_papers(max_results: int = 1000) -> list[Record]:
 
             published = item.get("publishedAt")
 
+            # Same first-party extraction as crawl_arxiv — try every plausible
+            # key name for the abstract text since this field name isn't
+            # confirmed against a live response; worst case it finds nothing
+            # and github_url stays None, which is the safe default anyway.
+            summary_text = (
+                paper.get("summary") or paper.get("abstract")
+                or item.get("summary") or item.get("abstract") or ""
+            )
+
             content: dict[str, Any] = {
                 "title": title,
                 "authors": authors,
                 "paper_url": paper_url,
-                "github_url": None,
+                "github_url": extract_github_url(summary_text),
                 "github_stars": None,
                 "published_date": published,
             }
@@ -362,7 +394,11 @@ async def crawl_hf_papers(max_results: int = 1000) -> list[Record]:
         offset += len(data)
         await asyncio.sleep(0.5)
 
-    logger.info("hf_papers_crawled count=%d", len(records))
+    await _attach_github_stars(records)
+    logger.info(
+        "hf_papers_crawled count=%d with_github_link=%d",
+        len(records), sum(1 for r in records if r.content.get("github_url")),
+    )
     return records
 
 
