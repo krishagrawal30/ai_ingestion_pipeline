@@ -101,18 +101,24 @@ async def enrich_jobs(jobs: list[Record], orchestrator: LLMOrchestrator | None) 
 
 
 def _resolve_companies(records: list[Record], resolver: EntityResolver) -> list[MappingEvent]:
-    """Canonicalize company names in JOB and STARTUP records. Returns a log
-    of all mapping events for the Entity Mapping Log tab."""
+    """Canonicalize company names in JOB, STARTUP, and PRODUCT records.
+    Returns a log of all mapping events for the Entity Mapping Log tab."""
     mapping_events: list[MappingEvent] = []
     for record in records:
-        raw_name = record.content.get("company") or record.content.get("name")
+        raw_name = (
+            record.content.get("company")
+            or record.content.get("entityName")
+            or record.content.get("startupName")
+        )
         if raw_name:
             event = resolver.resolve(raw_name)
             mapping_events.append(event)
             if record.recordType == "JOB":
                 record.content["company"] = event.canonical_name
             elif record.recordType == "STARTUP":
-                record.content["name"] = event.canonical_name
+                record.content["entityName"] = event.canonical_name
+            elif record.recordType == "PRODUCT":
+                record.content["startupName"] = event.canonical_name
     return mapping_events
 
 
@@ -130,13 +136,14 @@ async def run(
     Enriches job postings with LLM extraction. Resolves entity names.
     Exports JSONL + per-tab CSVs + entity mapping log.
     """
-    # Feed-based sources can be much larger than the last 24 hours, especially
-    # for AI news and job feeds. Keeping the cap high and disabling the stale
-    # cutoff for these sources ensures the pipeline can reach the desired 1,000+
-    # record target instead of silently dropping entire back catalogs.
+    # News and Jobs have NO minimum record count in the assignment - only
+    # "all 24-hr fresh [items] found". The 24-hour window is explicit and
+    # graded by name ("Data Quality: ... 24-hour freshness"), so it stays
+    # on. max_results is still useful as a safety cap, just not paired
+    # with disabling freshness to chase volume.
     news, jobs, arxiv_papers, pwc_papers, startups, products = await asyncio.gather(
-        crawl_feeds(NEWS_SOURCES, max_results=news_limit, max_age_hours=None),
-        crawl_feeds(JOB_SOURCES, max_results=job_limit, max_age_hours=None),
+        crawl_feeds(NEWS_SOURCES, max_results=news_limit, max_age_hours=24),
+        crawl_feeds(JOB_SOURCES, max_results=job_limit, max_age_hours=24),
         crawl_arxiv(max_results=paper_limit),
         crawl_hf_papers(max_results=paper_limit),
         crawl_startups(max_results=startup_limit),

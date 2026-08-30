@@ -16,18 +16,29 @@ def write_jsonl(records: Iterable[Record], path: Path) -> None:
             output.write(json.dumps(record.to_dict(), ensure_ascii=True) + "\n")
 
 
-def _flatten_value(value: object) -> str:
-    if isinstance(value, list):
-        return "; ".join(str(v) for v in value)
-    if value is None:
-        return ""
-    return str(value)
+def _flatten_content(content: dict, prefix: str = "") -> dict[str, str]:
+    """Recursively flatten nested dicts into dot-joined keys - matching the
+    assignment's own 'content.data.employeeCount' notation - rather than
+    stringifying a nested dict as Python repr (e.g. "{'employeeCount':
+    None}"), which isn't a usable spreadsheet cell."""
+    flat: dict[str, str] = {}
+    for key, value in content.items():
+        full_key = f"{prefix}.{key}" if prefix else key
+        if isinstance(value, dict):
+            flat.update(_flatten_content(value, full_key))
+        elif isinstance(value, list):
+            flat[full_key] = "; ".join(str(v) for v in value)
+        elif value is None:
+            flat[full_key] = ""
+        else:
+            flat[full_key] = str(value)
+    return flat
 
 
 def export_tabs(records: Iterable[Record], output_dir: Path) -> None:
     """Export records into per-type CSV files matching the 6 Google Sheet
     tabs. Content fields are flattened into their own columns (e.g.
-    github_stars, published_date) rather than dumped as one JSON-blob
+    github_stars, data.employeeCount) rather than dumped as one JSON-blob
     column — a spreadsheet with escaped JSON in every cell isn't a usable
     deliverable for someone opening it in Google Sheets."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -44,13 +55,15 @@ def export_tabs(records: Iterable[Record], output_dir: Path) -> None:
     base_fields = ["schemaVersion", "recordType", "source_name", "source_url", "collectedAt"]
     for record_type, filename in names.items():
         rows = groups.get(record_type, [])
-        # Union of content keys for this type, in first-seen order — each
-        # record type has a different content shape, so this can't be a
-        # single fixed fieldname list across all five tabs.
+        flattened = [_flatten_content(record.content) for record in rows]
+
+        # Union of flattened content keys for this type, in first-seen
+        # order — each record type has a different content shape, so this
+        # can't be a single fixed fieldname list across all five tabs.
         content_fields: list[str] = []
         seen: set[str] = set()
-        for record in rows:
-            for key in record.content:
+        for flat in flattened:
+            for key in flat:
                 if key not in seen:
                     seen.add(key)
                     content_fields.append(key)
@@ -58,7 +71,7 @@ def export_tabs(records: Iterable[Record], output_dir: Path) -> None:
         with (output_dir / f"{filename}.csv").open("w", newline="", encoding="utf-8") as output:
             writer = csv.DictWriter(output, fieldnames=fieldnames)
             writer.writeheader()
-            for record in rows:
+            for record, flat in zip(rows, flattened):
                 row = {
                     "schemaVersion": record.schemaVersion,
                     "recordType": record.recordType,
@@ -67,7 +80,7 @@ def export_tabs(records: Iterable[Record], output_dir: Path) -> None:
                     "collectedAt": record.collectedAt,
                 }
                 for key in content_fields:
-                    row[key] = _flatten_value(record.content.get(key))
+                    row[key] = flat.get(key, "")
                 writer.writerow(row)
 
 

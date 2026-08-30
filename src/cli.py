@@ -5,7 +5,7 @@ import asyncio
 import logging
 from pathlib import Path
 
-from .pipeline import run
+from ..ai_ingestion_pipeline_final.src.pipeline import run
 
 
 def main() -> None:
