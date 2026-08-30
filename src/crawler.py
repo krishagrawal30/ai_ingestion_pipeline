@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import urllib.parse
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -179,6 +180,56 @@ async def crawl_feeds(sources: list[FeedSource], concurrency: int = 10) -> list[
 # ArXiv crawler (paginated to support 1000+ papers)
 # ---------------------------------------------------------------------------
 
+_GITHUB_URL_PATTERN = re.compile(r"https?://github\.com/[\w][\w.-]*/[\w][\w.-]*")
+
+# GitHub search API can be queried for repos mentioning an arXiv ID/title,
+# but this was tested against the live API and found unreliable: popular,
+# unrelated repos (roadmaps, "paper to code" meta-tools) that happen to
+# reference many arXiv links outrank the actual implementation. Given the
+# assignment's disqualification clause for fabricated data, asserting a
+# paper<->repo link we can't actually verify is worse than leaving it null.
+# The one source that IS reliable: authors increasingly self-report their
+# repo directly in the abstract text ("Code: https://github.com/..."),
+# which arXiv's API already returns in <summary>. That's first-party and
+# needs no extra API call to find — only to confirm the star count.
+
+
+def extract_github_url(text: str) -> str | None:
+    """Find a GitHub repo URL an author put in their own abstract. Returns
+    the owner/repo URL with any trailing path (blob/main/README.md etc.)
+    stripped, or None if the abstract doesn't mention one."""
+    if not text:
+        return None
+    match = _GITHUB_URL_PATTERN.search(text)
+    if not match:
+        return None
+    url = match.group(0).rstrip(").,;:'\"")
+    parts = url.split("/")
+    return "/".join(parts[:5]) if len(parts) >= 5 else url
+
+
+_GITHUB_STARS_CONCURRENCY = 5
+
+
+async def _attach_github_stars(records: list[Record]) -> None:
+    """Fill in github_stars for any RESEARCH_PAPER record that already has
+    a github_url (mutates in place). Bounded concurrency — GitHub's
+    unauthenticated rate limit is 60/hour; even with a token it's worth
+    not bursting hundreds of calls at once (same thundering-herd risk as
+    the Groq job-enrichment fix)."""
+    semaphore = asyncio.Semaphore(_GITHUB_STARS_CONCURRENCY)
+    token = os.getenv("GITHUB_TOKEN")
+
+    async def fill(record: Record) -> None:
+        url = record.content.get("github_url")
+        if not url:
+            return
+        async with semaphore:
+            record.content["github_stars"] = await github_stars(url, token=token)
+
+    await asyncio.gather(*(fill(r) for r in records))
+
+
 async def crawl_arxiv(query: str = "cat:cs.AI", max_results: int = 1000) -> list[Record]:
     """Fetch papers from ArXiv using pagination (start + max_results).
 
@@ -214,6 +265,7 @@ async def crawl_arxiv(query: str = "cat:cs.AI", max_results: int = 1000) -> list
                 break
             title = _text(entry, f"{namespace}title")
             paper_url = _text(entry, f"{namespace}id")
+            summary = _text(entry, f"{namespace}summary")
             published = parse_date(_text(entry, f"{namespace}published"))
             authors = [
                 author.text.strip()
@@ -228,7 +280,7 @@ async def crawl_arxiv(query: str = "cat:cs.AI", max_results: int = 1000) -> list
                         "title": title,
                         "authors": authors,
                         "paper_url": paper_url,
-                        "github_url": None,
+                        "github_url": extract_github_url(summary),
                         "github_stars": None,
                         "published_date": published.isoformat() if published else None,
                     },
@@ -239,7 +291,11 @@ async def crawl_arxiv(query: str = "cat:cs.AI", max_results: int = 1000) -> list
         # ArXiv asks for 3s delay between requests
         await asyncio.sleep(3.0)
 
-    logger.info("arxiv_crawled count=%d", len(records))
+    await _attach_github_stars(records)
+    logger.info(
+        "arxiv_crawled count=%d with_github_link=%d",
+        len(records), sum(1 for r in records if r.content.get("github_url")),
+    )
     return records
 
 

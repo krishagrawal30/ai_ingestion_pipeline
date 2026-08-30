@@ -75,8 +75,12 @@ def _parse_llm_json(content: str) -> dict[str, Any]:
 # Provider: Google Gemini Flash
 # ---------------------------------------------------------------------------
 
-def gemini_provider(model: str = "gemini-2.0-flash") -> Provider:
-    """Google Gemini via the REST generateContent endpoint."""
+def gemini_provider(model: str = "gemini-3.1-flash-lite") -> Provider:
+    """Google Gemini via the REST generateContent endpoint.
+
+    gemini-2.0-flash is retired and gemini-2.5-flash is being sunset
+    Oct 16 2026 — gemini-3.1-flash-lite is current as of Aug 2026. Check
+    ai.google.dev/gemini-api/docs/models if this ever 404s."""
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY is missing.")
@@ -141,8 +145,11 @@ def groq_provider(model: str = "openai/gpt-oss-120b") -> Provider:
 # Provider: DeepSeek
 # ---------------------------------------------------------------------------
 
-def deepseek_provider(model: str = "deepseek-chat") -> Provider:
-    """DeepSeek via their OpenAI-compatible chat completions endpoint."""
+def deepseek_provider(model: str = "deepseek-v4-flash") -> Provider:
+    """DeepSeek via their OpenAI-compatible chat completions endpoint.
+
+    DeepSeek discontinued deepseek-chat / deepseek-reasoner in July 2026 —
+    deepseek-v4-flash is the current equivalent as of Aug 2026."""
     api_key = os.getenv("DEEPSEEK_API_KEY")
     if not api_key:
         raise RuntimeError("DEEPSEEK_API_KEY is missing.")

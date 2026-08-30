@@ -16,8 +16,20 @@ def write_jsonl(records: Iterable[Record], path: Path) -> None:
             output.write(json.dumps(record.to_dict(), ensure_ascii=True) + "\n")
 
 
+def _flatten_value(value: object) -> str:
+    if isinstance(value, list):
+        return "; ".join(str(v) for v in value)
+    if value is None:
+        return ""
+    return str(value)
+
+
 def export_tabs(records: Iterable[Record], output_dir: Path) -> None:
-    """Export records into per-type CSV files matching the 6 Google Sheet tabs."""
+    """Export records into per-type CSV files matching the 6 Google Sheet
+    tabs. Content fields are flattened into their own columns (e.g.
+    github_stars, published_date) rather than dumped as one JSON-blob
+    column — a spreadsheet with escaped JSON in every cell isn't a usable
+    deliverable for someone opening it in Google Sheets."""
     output_dir.mkdir(parents=True, exist_ok=True)
     groups: dict[str, list[Record]] = {}
     for record in records:
@@ -29,20 +41,34 @@ def export_tabs(records: Iterable[Record], output_dir: Path) -> None:
         "JOB": "Jobs",
         "NEWS": "News",
     }
+    base_fields = ["schemaVersion", "recordType", "source_name", "source_url", "collectedAt"]
     for record_type, filename in names.items():
         rows = groups.get(record_type, [])
+        # Union of content keys for this type, in first-seen order — each
+        # record type has a different content shape, so this can't be a
+        # single fixed fieldname list across all five tabs.
+        content_fields: list[str] = []
+        seen: set[str] = set()
+        for record in rows:
+            for key in record.content:
+                if key not in seen:
+                    seen.add(key)
+                    content_fields.append(key)
+        fieldnames = base_fields + content_fields
         with (output_dir / f"{filename}.csv").open("w", newline="", encoding="utf-8") as output:
-            writer = csv.DictWriter(output, fieldnames=["schemaVersion", "recordType", "source_name", "source_url", "content", "collectedAt"])
+            writer = csv.DictWriter(output, fieldnames=fieldnames)
             writer.writeheader()
             for record in rows:
-                writer.writerow({
+                row = {
                     "schemaVersion": record.schemaVersion,
                     "recordType": record.recordType,
                     "source_name": record.source.name,
                     "source_url": record.source.url,
-                    "content": json.dumps(record.content, ensure_ascii=True),
                     "collectedAt": record.collectedAt,
-                })
+                }
+                for key in content_fields:
+                    row[key] = _flatten_value(record.content.get(key))
+                writer.writerow(row)
 
 
 def write_entity_log(events: Iterable[MappingEvent], output_dir: Path) -> None:

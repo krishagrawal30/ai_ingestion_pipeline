@@ -87,7 +87,7 @@ async def enrich_job(record: Record, orchestrator: LLMOrchestrator | None) -> Re
 # where every task retries in lockstep and re-collides on the next attempt
 # (visible in real logs as synchronized bursts ~20s apart). Bounding
 # concurrency the same way crawl_feeds() already does fixes this.
-LLM_CONCURRENCY = 3
+LLM_CONCURRENCY = 2
 
 
 async def enrich_jobs(jobs: list[Record], orchestrator: LLMOrchestrator | None) -> list[Record]:
