@@ -4,6 +4,7 @@ import json
 import logging
 import os
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -11,13 +12,14 @@ import httpx
 try:
     from dotenv import load_dotenv
 except ImportError:  # pragma: no cover - optional dependency in minimal environments
-    def load_dotenv() -> bool:
+    def load_dotenv(*args, **kwargs) -> bool:
         return False
 
 from .chunking import semantic_chunks
 from .retry import with_backoff
 
-load_dotenv()
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(_PROJECT_ROOT / ".env")
 
 logger = logging.getLogger(__name__)
 Provider = Callable[[str], Awaitable[dict[str, Any]]]

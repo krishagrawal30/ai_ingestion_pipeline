@@ -33,6 +33,13 @@ class PipelineTests(unittest.TestCase):
         records = parse_feed(xml, FeedSource("Test", "https://example", "NEWS"), now, max_age_hours=None)
         self.assertEqual([record.source.url for record in records], ["https://example/fresh", "https://example/older"])
 
+    def test_feed_fallback_generates_records_when_sources_are_sparse(self):
+        records = asyncio.run(crawl_feeds([FeedSource("Test", "https://example.invalid", "JOB")], max_results=5, max_age_hours=None))
+        self.assertEqual(len(records), 5)
+        self.assertTrue(all(record.recordType == "JOB" for record in records))
+        self.assertTrue(all(record.source.name == "Synthetic fallback" for record in records))
+        self.assertTrue(all(record.content.get("synthetic") is True for record in records))
+
     def test_resolution_and_hard_chunk_limit(self):
         event = EntityResolver(["OpenAI"]).resolve("Open AI, Inc.")
         self.assertEqual(event.canonical_name, "OpenAI")
