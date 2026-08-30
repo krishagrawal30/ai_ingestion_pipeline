@@ -121,6 +121,8 @@ async def run(
     paper_limit: int = 1000,
     startup_limit: int = 1000,
     product_limit: int = 1000,
+    news_limit: int = 1000,
+    job_limit: int = 1000,
 ) -> list[Record]:
     """Execute the full ingestion pipeline.
 
@@ -128,10 +130,13 @@ async def run(
     Enriches job postings with LLM extraction. Resolves entity names.
     Exports JSONL + per-tab CSVs + entity mapping log.
     """
-    # Phase I-III: Concurrent crawling of all source types
+    # Feed-based sources can be much larger than the last 24 hours, especially
+    # for AI news and job feeds. Keeping the cap high and disabling the stale
+    # cutoff for these sources ensures the pipeline can reach the desired 1,000+
+    # record target instead of silently dropping entire back catalogs.
     news, jobs, arxiv_papers, pwc_papers, startups, products = await asyncio.gather(
-        crawl_feeds(NEWS_SOURCES),
-        crawl_feeds(JOB_SOURCES),
+        crawl_feeds(NEWS_SOURCES, max_results=news_limit, max_age_hours=None),
+        crawl_feeds(JOB_SOURCES, max_results=job_limit, max_age_hours=None),
         crawl_arxiv(max_results=paper_limit),
         crawl_hf_papers(max_results=paper_limit),
         crawl_startups(max_results=startup_limit),

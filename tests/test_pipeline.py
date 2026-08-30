@@ -22,6 +22,17 @@ class PipelineTests(unittest.TestCase):
         records = parse_feed(xml, FeedSource("Test", "https://example", "NEWS"), now)
         self.assertEqual([record.source.url for record in records], ["https://example/fresh"])
 
+    def test_feed_can_include_older_records_when_freshness_is_disabled(self):
+        xml = (
+            "<rss><channel>"
+            "<item><title>Fresh</title><link>https://example/fresh</link><pubDate>Fri, 28 Aug 2026 11:00:00 GMT</pubDate></item>"
+            "<item><title>Older</title><link>https://example/older</link><pubDate>Tue, 25 Aug 2026 11:00:00 GMT</pubDate></item>"
+            "</channel></rss>"
+        )
+        now = datetime(2026, 8, 28, 12, tzinfo=timezone.utc)
+        records = parse_feed(xml, FeedSource("Test", "https://example", "NEWS"), now, max_age_hours=None)
+        self.assertEqual([record.source.url for record in records], ["https://example/fresh", "https://example/older"])
+
     def test_resolution_and_hard_chunk_limit(self):
         event = EntityResolver(["OpenAI"]).resolve("Open AI, Inc.")
         self.assertEqual(event.canonical_name, "OpenAI")

@@ -160,7 +160,7 @@ def _sanitize_xml(xml: str) -> str:
     return xml
 
 
-def parse_feed(xml: str, source: FeedSource, now=None) -> list[Record]:
+def parse_feed(xml: str, source: FeedSource, now=None, max_age_hours: int | None = 24) -> list[Record]:
     root = ET.fromstring(_sanitize_xml(xml))
     records: list[Record] = []
     for item in root.findall(".//item") + root.findall(".//{http://www.w3.org/2005/Atom}entry"):
@@ -170,7 +170,9 @@ def parse_feed(xml: str, source: FeedSource, now=None) -> list[Record]:
             link_node = item.find("{http://www.w3.org/2005/Atom}link")
             link = link_node.attrib.get("href", "") if link_node is not None else ""
         date = parse_date(_text(item, "pubDate", "published", "updated", "{http://www.w3.org/2005/Atom}updated"), now)
-        if not title or not link or not is_fresh(date, now):
+        if not title or not link:
+            continue
+        if max_age_hours is not None and (date is None or not is_fresh(date, now, hours=max_age_hours)):
             continue
         description = _text(item, "description", "summary", "{http://www.w3.org/2005/Atom}summary")
         content: dict[str, Any] = {"title": title, "url": link, "date": date.isoformat() if date else None}
@@ -184,19 +186,34 @@ def parse_feed(xml: str, source: FeedSource, now=None) -> list[Record]:
     return records
 
 
-async def crawl_feeds(sources: list[FeedSource], concurrency: int = 10) -> list[Record]:
+async def crawl_feeds(
+    sources: list[FeedSource],
+    concurrency: int = 10,
+    max_results: int | None = None,
+    max_age_hours: int | None = 24,
+) -> list[Record]:
     semaphore = asyncio.Semaphore(concurrency)
 
     async def crawl(source: FeedSource) -> list[Record]:
         async with semaphore:
             try:
-                return parse_feed(await fetch(source.url), source)
+                records = parse_feed(await fetch(source.url), source, max_age_hours=max_age_hours)
+                if max_results is not None:
+                    return records[:max_results]
+                return records
             except Exception as error:
                 logger.warning("source_failed source=%s error=%s", source.name, error)
                 return []
 
     results = await asyncio.gather(*(crawl(source) for source in sources))
-    return [record for batch in results for record in batch]
+    collected: list[Record] = []
+    for batch in results:
+        if max_results is None:
+            collected.extend(batch)
+        elif len(collected) < max_results:
+            remaining = max_results - len(collected)
+            collected.extend(batch[:remaining])
+    return collected
 
 
 # ---------------------------------------------------------------------------
