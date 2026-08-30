@@ -502,7 +502,7 @@ _PRODUCT_QUERIES = [
 ]
 
 
-async def crawl_products(max_results: int = 1000) -> list[Record]:
+async def crawl_products(max_results: int = 1200) -> list[Record]:
     """Discover AI products via GitHub repository search (popular repos as products)."""
     records: list[Record] = []
     seen_repos: set[str] = set()
